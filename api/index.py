@@ -347,11 +347,30 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def normalize_vercel_rewrites(request: Request, call_next):
+    """
+    Ensure complete compatibility with Vercel's internal rewrites.
+    Strips rewritten destination prefixes like /api/index.py or /api/index
+    so FastAPI routes (/webhook, /health, /api/state, /) always resolve correctly
+    regardless of how Vercel evaluates the rewritten destination path.
+    """
+    path = request.scope.get("path", "")
+    for prefix in ["/api/index.py", "/api/index"]:
+        if path.startswith(prefix):
+            new_path = path[len(prefix):] or "/"
+            request.scope["path"] = new_path
+            break
+    return await call_next(request)
+
+
 # ==============================================================================
 # 6. Webhook Receiver Endpoint
 # ==============================================================================
 
 @app.post("/webhook", status_code=status.HTTP_200_OK)
+@app.post("/api/webhook", status_code=status.HTTP_200_OK)
+@app.post("/api/index.py/webhook", status_code=status.HTTP_200_OK)
 async def handle_webhook(payload: TradingViewWebhookPayload, request: Request):
     """
     Process incoming TradingView alert webhooks and perform idempotent target-state execution.
@@ -548,6 +567,8 @@ async def event_stream(request: Request):
 
 
 @app.get("/api/state")
+@app.get("/state")
+@app.get("/api/index.py/api/state")
 async def get_state():
     """Returns current account metrics, balances, and open positions."""
     connector = get_connector()
@@ -555,12 +576,16 @@ async def get_state():
 
 
 @app.get("/api/events")
+@app.get("/events")
+@app.get("/api/index.py/api/events")
 async def get_events():
     """Returns the historical ring buffer of recent webhook executions."""
     return list(recent_events)
 
 
 @app.get("/health")
+@app.get("/api/health")
+@app.get("/api/index.py/health")
 async def health():
     connector = get_connector()
     return {
@@ -577,6 +602,8 @@ async def health():
 # ==============================================================================
 
 @app.get("/", response_class=HTMLResponse)
+@app.get("/api", response_class=HTMLResponse)
+@app.get("/api/index.py", response_class=HTMLResponse)
 async def dashboard_ui():
     """Interactive dark-mode quant trading dashboard."""
     html_content = """<!DOCTYPE html>
