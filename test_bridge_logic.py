@@ -94,6 +94,15 @@ class TestBridgeLogic(unittest.TestCase):
         self.assertTrue(hmac.compare_digest(secret, "SUPER_SECURE_TOKEN_XYZ"))
         self.assertFalse(hmac.compare_digest(secret, "WRONG_TOKEN"))
 
+    def test_main_and_api_proxy_exports(self):
+        import main
+        import api.index
+        self.assertEqual(main.app.title, "Hyperliquid TradingView Webhook Bridge")
+        self.assertEqual(api.index.app.title, "Hyperliquid TradingView Webhook Bridge")
+        connector = main.get_connector()
+        self.assertIsNotNone(connector)
+        self.assertTrue(hasattr(connector, "account_address"))
+
 
 if __name__ == "__main__":
     unittest.main()

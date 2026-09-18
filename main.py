@@ -16,15 +16,31 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from eth_account import Account
-from eth_account.signers.local import LocalAccount
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from hyperliquid.exchange import Exchange
-from hyperliquid.info import Info
-from hyperliquid.utils import constants
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Graceful SDK imports (prevents unhandled 500 FUNCTION_INVOCATION_FAILED on serverless)
+SDK_AVAILABLE = False
+SDK_IMPORT_ERROR: Optional[str] = None
+Account = None
+LocalAccount = None
+Exchange = None
+Info = None
+constants = None
+
+try:
+    from eth_account import Account
+    from eth_account.signers.local import LocalAccount
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+    SDK_AVAILABLE = True
+except Exception as exc:
+    SDK_AVAILABLE = False
+    SDK_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
 
 
 # ==============================================================================
@@ -123,7 +139,10 @@ class HyperliquidConnector:
 
     def __init__(self, config: Settings):
         self.config = config
-        self.base_url = constants.TESTNET_API_URL if config.IS_TESTNET else constants.MAINNET_API_URL
+        if constants is not None:
+            self.base_url = constants.TESTNET_API_URL if config.IS_TESTNET else constants.MAINNET_API_URL
+        else:
+            self.base_url = "https://api.hyperliquid-testnet.xyz" if config.IS_TESTNET else "https://api.hyperliquid.xyz"
         self.sz_decimals_cache: Dict[str, int] = {
             "BTC": 5, "ETH": 4, "SOL": 2, "HYPE": 2, "PURR": 0, "DOGE": 0, "AVAX": 2, "ARB": 1, "SUI": 1
         }
@@ -139,7 +158,7 @@ class HyperliquidConnector:
             or len(raw_key.replace("0x", "")) != 64
         )
 
-        if is_dummy_key:
+        if not SDK_AVAILABLE or is_dummy_key:
             self.is_simulation = True
             self.account_address = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
             self.wallet_address = self.account_address
@@ -148,14 +167,17 @@ class HyperliquidConnector:
             self.simulated_prices: Dict[str, float] = {
                 "BTC": 65420.50, "ETH": 3480.20, "SOL": 158.40, "HYPE": 24.50, "PURR": 0.185
             }
-            logger.info("Running in INTERACTIVE SIMULATION MODE.")
+            if not SDK_AVAILABLE:
+                logger.warning(f"Running in SIMULATION MODE: Hyperliquid SDK not loaded ({SDK_IMPORT_ERROR})")
+            else:
+                logger.info("Running in INTERACTIVE SIMULATION MODE.")
             self.info = None
             self.exchange = None
         else:
             try:
                 if not raw_key.startswith("0x"):
                     raw_key = "0x" + raw_key
-                self.wallet: LocalAccount = Account.from_key(raw_key)
+                self.wallet = Account.from_key(raw_key)
                 self.wallet_address = self.wallet.address
                 self.account_address = config.HL_ACCOUNT_ADDRESS.strip() if config.HL_ACCOUNT_ADDRESS else self.wallet.address
 
@@ -377,6 +399,7 @@ async def normalize_vercel_rewrites(request: Request, call_next):
 @app.post("/webhook", status_code=status.HTTP_200_OK)
 @app.post("/api/webhook", status_code=status.HTTP_200_OK)
 @app.post("/api/index.py/webhook", status_code=status.HTTP_200_OK)
+@app.post("/main.py/webhook", status_code=status.HTTP_200_OK)
 async def handle_webhook(payload: TradingViewWebhookPayload, request: Request):
     """
     Process incoming TradingView alert webhooks and perform idempotent target-state execution.
@@ -541,6 +564,10 @@ async def handle_webhook(payload: TradingViewWebhookPayload, request: Request):
 # ==============================================================================
 
 @app.get("/api/stream")
+@app.get("/stream")
+@app.get("/api/index.py/stream")
+@app.get("/api/index.py/api/stream")
+@app.get("/main.py/stream")
 async def event_stream(request: Request):
     """Server-Sent Events endpoint streaming live webhook executions to the dashboard."""
     queue: asyncio.Queue = asyncio.Queue()
@@ -575,6 +602,8 @@ async def event_stream(request: Request):
 @app.get("/api/state")
 @app.get("/state")
 @app.get("/api/index.py/api/state")
+@app.get("/api/index.py/state")
+@app.get("/main.py/state")
 async def get_state():
     """Returns current account metrics, balances, and open positions."""
     connector = get_connector()
@@ -584,6 +613,8 @@ async def get_state():
 @app.get("/api/events")
 @app.get("/events")
 @app.get("/api/index.py/api/events")
+@app.get("/api/index.py/events")
+@app.get("/main.py/events")
 async def get_events():
     """Returns the historical ring buffer of recent webhook executions."""
     return list(recent_events)
@@ -592,10 +623,13 @@ async def get_events():
 @app.get("/health")
 @app.get("/api/health")
 @app.get("/api/index.py/health")
+@app.get("/main.py/health")
 async def health():
     connector = get_connector()
     return {
-        "status": "healthy",
+        "status": "healthy" if SDK_AVAILABLE else "degraded",
+        "sdk_available": SDK_AVAILABLE,
+        "sdk_import_error": SDK_IMPORT_ERROR,
         "isSimulation": connector.is_simulation,
         "network": "SIMULATION" if connector.is_simulation else ("TESTNET" if settings.IS_TESTNET else "MAINNET"),
         "accountAddress": connector.account_address,
@@ -610,6 +644,7 @@ async def health():
 @app.get("/", response_class=HTMLResponse)
 @app.get("/api", response_class=HTMLResponse)
 @app.get("/api/index.py", response_class=HTMLResponse)
+@app.get("/main.py", response_class=HTMLResponse)
 async def dashboard_ui():
     """Interactive dark-mode quant trading dashboard."""
     html_content = """<!DOCTYPE html>
