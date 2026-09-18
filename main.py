@@ -432,6 +432,8 @@ async def normalize_vercel_rewrites(request: Request, call_next):
 @app.post("/api/webhook", status_code=status.HTTP_200_OK)
 @app.post("/api/index.py/webhook", status_code=status.HTTP_200_OK)
 @app.post("/main.py/webhook", status_code=status.HTTP_200_OK)
+@app.post("/api/index.py", status_code=status.HTTP_200_OK)
+@app.post("/", status_code=status.HTTP_200_OK)
 async def handle_webhook(payload: TradingViewWebhookPayload, request: Request):
     """
     Process incoming TradingView alert webhooks and perform idempotent target-state execution.
@@ -694,8 +696,25 @@ async def health():
 @app.get("/api", response_class=HTMLResponse)
 @app.get("/api/index.py", response_class=HTMLResponse)
 @app.get("/main.py", response_class=HTMLResponse)
-async def dashboard_ui():
+async def dashboard_ui(request: Request):
     """Interactive dark-mode quant trading dashboard."""
+    # Handle Vercel rewrite inspection when all paths are rewritten to /api/index.py
+    orig = request.headers.get("x-matched-path", "") or request.headers.get("x-vercel-matched-path", "")
+    orig_clean = orig.lower().strip("/")
+    if orig_clean:
+        if orig_clean in ("health", "api/health"):
+            res = await health()
+            return JSONResponse(content=res)
+        if orig_clean in ("state", "api/state"):
+            res = await get_state()
+            return JSONResponse(content=res)
+        if orig_clean in ("events", "api/events"):
+            res = await get_events()
+            return JSONResponse(content=res)
+        if orig_clean in ("_debug", "api/_debug"):
+            res = await debug_info()
+            return JSONResponse(content=res)
+
     html_content = """<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
