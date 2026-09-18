@@ -47,36 +47,48 @@ except Exception as exc:
 # 1. Configuration & Settings
 # ==============================================================================
 
-class Settings(BaseSettings):
-    """Bridge environment settings."""
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
-
-    HL_PRIVATE_KEY: str = Field(
-        default="0x0000000000000000000000000000000000000000000000000000000000000000",
-        description="Hyperliquid private key (agent or master key)"
-    )
-    HL_ACCOUNT_ADDRESS: Optional[str] = Field(
-        default=None,
-        description="Public 0x address of main Hyperliquid account holding collateral."
-    )
-    WEBHOOK_SECRET: str = Field(
-        default="7d24d42ff3328d6aaa5f672ffbbcfb7439a17556",
-        description="Shared secret for authenticating TradingView webhooks"
-    )
-    IS_TESTNET: bool = Field(default=False, description="Connect to Hyperliquid testnet instead of mainnet")
-    DEFAULT_SLIPPAGE: float = Field(default=0.05, description="Max slippage for aggressive IOC market orders (0.05 = 5%)")
-    HOST: str = Field(default="0.0.0.0", description="Server host bind address")
-    PORT: int = Field(default=8000, description="Server port")
-    LOG_LEVEL: str = Field(default="INFO", description="Logging level: DEBUG, INFO, WARNING, ERROR")
-
-
+# Try to load local .env if present
 try:
-    settings = Settings()
-except Exception as e:
-    settings = Settings(
-        HL_PRIVATE_KEY="0x0000000000000000000000000000000000000000000000000000000000000000",
-        WEBHOOK_SECRET="7d24d42ff3328d6aaa5f672ffbbcfb7439a17556"
-    )
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+class Settings:
+    """Crash-proof environment settings parser with safe type coercion."""
+
+    def __init__(self):
+        self.HL_PRIVATE_KEY: str = (
+            os.getenv("HL_PRIVATE_KEY", "0x0000000000000000000000000000000000000000000000000000000000000000").strip()
+            or "0x0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        raw_acct = os.getenv("HL_ACCOUNT_ADDRESS", "").strip()
+        self.HL_ACCOUNT_ADDRESS: Optional[str] = raw_acct if raw_acct else None
+
+        self.WEBHOOK_SECRET: str = (
+            os.getenv("WEBHOOK_SECRET", "7d24d42ff3328d6aaa5f672ffbbcfb7439a17556").strip()
+            or "7d24d42ff3328d6aaa5f672ffbbcfb7439a17556"
+        )
+
+        raw_testnet = os.getenv("IS_TESTNET", "false").strip().lower()
+        self.IS_TESTNET: bool = raw_testnet in ("true", "1", "yes", "t")
+
+        try:
+            self.DEFAULT_SLIPPAGE: float = float(os.getenv("DEFAULT_SLIPPAGE", "0.05").strip() or 0.05)
+        except (ValueError, TypeError):
+            self.DEFAULT_SLIPPAGE = 0.05
+
+        self.HOST: str = os.getenv("HOST", "0.0.0.0").strip() or "0.0.0.0"
+
+        try:
+            self.PORT: int = int(os.getenv("PORT", "8000").strip() or 8000)
+        except (ValueError, TypeError):
+            self.PORT = 8000
+
+        self.LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+
+
+settings = Settings()
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -375,20 +387,40 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    import traceback
+    logger.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}\n{traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "error": str(exc),
+            "type": type(exc).__name__,
+            "path": request.url.path,
+            "traceback": traceback.format_exc(),
+        },
+    )
+
+
 @app.middleware("http")
 async def normalize_vercel_rewrites(request: Request, call_next):
     """
     Ensure complete compatibility with Vercel's internal rewrites.
-    Strips rewritten destination prefixes like /api/index.py or /api/index
-    so FastAPI routes (/webhook, /health, /api/state, /) always resolve correctly
-    regardless of how Vercel evaluates the rewritten destination path.
+    Restores x-matched-path if present, or strips rewritten destination prefixes.
     """
-    path = request.scope.get("path", "")
-    for prefix in ["/api/index.py", "/api/index"]:
-        if path.startswith(prefix):
-            new_path = path[len(prefix):] or "/"
-            request.scope["path"] = new_path
-            break
+    matched_path = request.headers.get("x-matched-path")
+    if matched_path:
+        request.scope["path"] = matched_path
+    else:
+        path = request.scope.get("path", "")
+        for prefix in ["/api/index.py", "/api/index", "/main.py"]:
+            if path == prefix:
+                request.scope["path"] = "/"
+                break
+            elif path.startswith(prefix + "/"):
+                request.scope["path"] = path[len(prefix):] or "/"
+                break
     return await call_next(request)
 
 
@@ -618,6 +650,23 @@ async def get_state():
 async def get_events():
     """Returns the historical ring buffer of recent webhook executions."""
     return list(recent_events)
+
+
+@app.get("/_debug")
+@app.get("/api/_debug")
+@app.get("/api/index.py/_debug")
+@app.get("/main.py/_debug")
+async def debug_info():
+    connector = get_connector()
+    return {
+        "status": "ok",
+        "python_version": sys.version,
+        "sdk_available": SDK_AVAILABLE,
+        "sdk_import_error": SDK_IMPORT_ERROR,
+        "is_simulation": connector.is_simulation,
+        "cwd": os.getcwd(),
+        "env_keys": sorted(list(os.environ.keys())),
+    }
 
 
 @app.get("/health")
