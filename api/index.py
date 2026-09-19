@@ -403,25 +403,53 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
-@app.middleware("http")
-async def normalize_vercel_rewrites(request: Request, call_next):
+class PathRewriteMiddleware:
     """
-    Ensure complete compatibility with Vercel's internal rewrites.
-    Restores x-matched-path if present, or strips rewritten destination prefixes.
+    ASGI middleware ensuring reliable routing across Vercel serverless environments.
+    Inspects __path query params, Vercel matched-path headers, and strips entrypoint prefixes.
     """
-    matched_path = request.headers.get("x-matched-path")
-    if matched_path:
-        request.scope["path"] = matched_path
-    else:
-        path = request.scope.get("path", "")
-        for prefix in ["/api/index.py", "/api/index", "/main.py"]:
-            if path == prefix:
-                request.scope["path"] = "/"
-                break
-            elif path.startswith(prefix + "/"):
-                request.scope["path"] = path[len(prefix):] or "/"
-                break
-    return await call_next(request)
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            from urllib.parse import parse_qs
+            path = scope.get("path", "")
+            qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
+            params = parse_qs(qs)
+
+            # 1. Check __path query parameter
+            if "__path" in params and params["__path"] and params["__path"][0]:
+                target = "/" + params["__path"][0].lstrip("/")
+                scope["path"] = target
+                scope["raw_path"] = target.encode("utf-8")
+            else:
+                # 2. Check headers for original matched path
+                headers = dict(scope.get("headers", []))
+                for h_name in (b"x-matched-path", b"x-vercel-matched-path", b"x-forwarded-path", b"x-original-url", b"x-rewrite-url"):
+                    val = headers.get(h_name, b"").decode("utf-8", errors="replace").strip()
+                    if val and val not in ("/api/index.py", "/api/index", "/main.py", "/", "/api"):
+                        target = "/" + val.lstrip("/")
+                        scope["path"] = target
+                        scope["raw_path"] = target.encode("utf-8")
+                        break
+                else:
+                    # 3. Strip framework entrypoints if nested
+                    for prefix in ("/api/index.py", "/api/index", "/main.py"):
+                        if path == prefix:
+                            scope["path"] = "/"
+                            scope["raw_path"] = b"/"
+                            break
+                        elif path.startswith(prefix + "/"):
+                            target = path[len(prefix):] or "/"
+                            scope["path"] = target
+                            scope["raw_path"] = target.encode("utf-8")
+                            break
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(PathRewriteMiddleware)
 
 
 # ==============================================================================
@@ -698,22 +726,23 @@ async def health():
 @app.get("/main.py", response_class=HTMLResponse)
 async def dashboard_ui(request: Request):
     """Interactive dark-mode quant trading dashboard."""
-    # Handle Vercel rewrite inspection when all paths are rewritten to /api/index.py
-    orig = request.headers.get("x-matched-path", "") or request.headers.get("x-vercel-matched-path", "")
-    orig_clean = orig.lower().strip("/")
-    if orig_clean:
-        if orig_clean in ("health", "api/health"):
-            res = await health()
-            return JSONResponse(content=res)
-        if orig_clean in ("state", "api/state"):
-            res = await get_state()
-            return JSONResponse(content=res)
-        if orig_clean in ("events", "api/events"):
-            res = await get_events()
-            return JSONResponse(content=res)
-        if orig_clean in ("_debug", "api/_debug"):
-            res = await debug_info()
-            return JSONResponse(content=res)
+    if request is not None:
+        param_path = request.query_params.get("__path", "").strip("/")
+        orig = param_path or request.headers.get("x-matched-path", "") or request.headers.get("x-vercel-matched-path", "") or request.headers.get("x-forwarded-path", "")
+        orig_clean = orig.lower().strip("/")
+        if orig_clean and orig_clean not in ("api/index.py", "main.py", "api/index", "api", ""):
+            if "health" in orig_clean:
+                res = await health()
+                return JSONResponse(content=res)
+            if "state" in orig_clean:
+                res = await get_state()
+                return JSONResponse(content=res)
+            if "events" in orig_clean:
+                res = await get_events()
+                return JSONResponse(content=res)
+            if "debug" in orig_clean:
+                res = await debug_info()
+                return JSONResponse(content=res)
 
     html_content = """<!DOCTYPE html>
 <html lang="en" class="dark">
@@ -1260,7 +1289,7 @@ async def dashboard_ui(request: Request):
 # ==============================================================================
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)
-async def catch_all_get_route(full_path: str):
+async def catch_all_get_route(full_path: str, request: Request):
     """
     Catch-all GET route ensuring any path routed by Vercel
     correctly serves the dashboard or API endpoint.
@@ -1275,7 +1304,10 @@ async def catch_all_get_route(full_path: str):
     if "events" in clean:
         res = await get_events()
         return JSONResponse(content=res)
-    return await dashboard_ui()
+    if "debug" in clean:
+        res = await debug_info()
+        return JSONResponse(content=res)
+    return await dashboard_ui(request)
 
 
 @app.post("/{full_path:path}", status_code=status.HTTP_200_OK)
